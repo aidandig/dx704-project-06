@@ -1,0 +1,190 @@
+Used Gemini to confirm my logic in answering Part 3. Used a temporary chat so here is the full transcript:
+
+Prompt:
+
+Given my optimal treatment plans:
+
+states = R['state'].unique()
+n_states = len(states)
+
+actions = R['action'].unique()
+n_actions = len(actions)
+
+R_pivot = R.pivot(index='action', columns='state', values='reward')
+R_numpy = R_pivot.reindex(index=actions, columns=states).to_numpy()
+
+P_list = []
+for a in actions:
+P_a = (
+P[P['action'] == a]
+.pivot(index='state', columns='next_state', values='probability')
+.reindex(index=states, columns=states)
+.fillna(0.0)
+.to_numpy()
+)
+P_list.append(P_a)
+
+P_numpy= np.array(P_list)
+
+v_reward = value_iteration(R_numpy, P_numpy, gamma=1.0)
+
+Q = compute_qT_once(R_numpy, P_numpy, gamma=1.0, v=v_reward)
+
+best_actions_indices = np.argmax(Q, axis=0)
+best_actions = [actions[i] for i in best_actions_indices]
+
+optimal_treatment = pd.DataFrame(
+{'state': states, 'action': best_actions}
+)
+optimal_treatment
+
+I am going to calculate the expected discomfort per treatment plan based on the similar logic below:
+
+states = R['state'].unique()
+n_states = len(states)
+
+R_do_nothing = R[R['action'] == 'do-nothing']
+
+# Reward would have negative, but since we measure discomfort the higher value = more discomfort
+discomfort = -R_do_nothing['reward'].to_numpy()
+
+R_discomfort = discomfort.reshape(1, n_states)
+
+transitions_do_nothing = P[P['action'] == 'do-nothing']
+transitions_do_nothing = transitions_do_nothing.pivot(index='state', columns='next_state', values='probability')
+
+P_do_nothing = transitions_do_nothing.reindex(index=states, columns=states).fillna(0.0).to_numpy()
+P_do_nothing = P_do_nothing.reshape(1, n_states, n_states)
+
+v_discomfort = value_iteration(R_discomfort, P_do_nothing, gamma=1.0)
+
+results = pd.DataFrame(
+{'state': states, 'expected_discomfort': v_discomfort}
+)
+results
+
+Do not give me code or the solution, just let me know if I am on the right track. For this goal, I would take the states and n_states from the optimal_treatment, then the R would be the -R given the R is filtered by the actions within the optimal_treatment and then reshaped
+
+Response:
+
+You are on the right conceptual track with the sign flip, but **your proposed mechanical approach needs an important correction**.
+
+Here is why:
+
+### 1. Filtering by action does not work the same way here
+
+In your "do-nothing" example, the chosen action was identical across **all** states (`action == 'do-nothing'`). Because of that, you could filter by that single action and get exactly one row/entry per state.
+
+Under `optimal_treatment`, the policy is state-dependent: **state $s$ uses action $\pi(s)$**.
+
+* If you simply filter $R$ and $P$ by `R['action'].isin(optimal_treatment['action'])`, multiple states that share the same action will pull multiple records, and states with unique actions will pull only one.
+* Filtering by action alone breaks the 1-to-1 alignment between state $i$ and its specific assigned action $\pi(s_i)$.
+
+### 2. What needs to happen instead
+
+To evaluate the expected discomfort under a fixed policy $\pi$:
+
+* **For Discomfort ($R_\pi$):** For each state index $i$, you need the reward corresponding specifically to the pair $(s_i, \pi(s_i))$. In matrix terms, rather than reshaping a filtered table, you select $R_{\text{numpy}}[\pi(s_i), i]$ for each state $i$, then negate it. This gives a vector of length $n\_states$ (or shape $(1, n\_states)$).
+* **For Transitions ($P_\pi$):** You must do the same for the transition matrix. Row $i$ of the policy transition matrix $P_\pi$ must come from $P_{\text{numpy}}[\pi(s_i), i, :]$. Stacking these for each state $i$ creates an $(n\_states \times n\_states)$ transition matrix (or $(1, n\_states, n\_states)$ if using your 1-action function format).
+
+### 3. Algorithm note
+
+Once a policy is fixed, there is no $\max_a$ choice to make anymore. What you are doing is **policy evaluation** (solving a linear system or running iterative updates on a fixed transition matrix), not finding an optimal policy via full value iteration across multiple candidate actions. Running your value iteration function with an effective action dimension of 1 will converge to the policy evaluation result, provided the Markov chain under $\pi$ and $\gamma=1.0$ is absorbing/terminating.
+
+
+Prompt:
+
+so I should turn the filtering into a tuple based approach: state, action
+
+Response:
+
+Yes, exactly. A `(state, action)` pair uniquely identifies each entry you need.
+
+Whether you:
+
+* Join/merge the DataFrames on `['state', 'action']`, or
+* Index into your existing `R_numpy` and `P_numpy` arrays using the `(best_actions_indices, state_indices)` pairs,
+
+pairing the specific state with its assigned action resolves the alignment issue completely.
+
+
+Prompt:
+
+How do I convert this to a tuple? plans = optimal_treatment[['state', 'action']].values
+
+Response:
+
+Here are the two standard ways, depending on how you plan to use it:
+
+### 1. A Python list of `(state, action)` tuples
+
+If you want to iterate over pairs (e.g., in a `for s, a in plans:` loop) or check membership with `in`:
+
+* **From the DataFrame directly (cleanest):**
+```python
+plans = list(zip(optimal_treatment['state'], optimal_treatment['action']))
+
+```
+
+
+* **Or from your array:**
+```python
+plans = [tuple(row) for row in optimal_treatment[['state', 'action']].to_numpy()]
+
+```
+
+
+
+Output format:
+
+```python
+[('state_1', 'action_A'), ('state_2', 'action_B'), ...]
+
+```
+
+---
+
+### 2. A pandas `MultiIndex` (best for DataFrame filtering)
+
+If you need to filter `R` or `P` using these pairs without doing a full `.merge()`:
+
+```python
+# Convert pairs to a MultiIndex
+target_pairs = pd.MultiIndex.from_frame(optimal_treatment[['state', 'action']])
+
+# Set matching index on R and filter using .isin()
+R_filtered = R.set_index(['state', 'action']).loc[target_pairs].reset_index()
+
+```
+
+*(Using `.loc[target_pairs]` has the added benefit of preserving the exact row order of `optimal_treatment`.)*
+
+
+Prompt:
+
+I would need to filter the transitions so that the state and actions match?
+
+Response:
+
+Yes, exactly.
+
+The transition table $P$ contains multiple rows for each state—one for every possible action that can be taken from that state.
+
+To evaluate the policy, you only want the transitions caused by the policy's specific choice. So you must filter $P$ so that each origin `state` is paired strictly with the `action` assigned to it in your treatment plan. Once filtered, you will have the correct probability distribution across `next_state` for every state under that fixed plan.
+
+
+Prompt:
+
+then I reshape the filtered  transitions numpy array to (1, n_states, n_states)?
+
+Response:
+
+Yes, exactly.
+
+Once you:
+
+1. Filter the transitions to match your `(state, action)` pairs,
+2. Pivot them (`index='state'`, `columns='next_state'`, `values='probability'`),
+3. Reindex both axes against `states`, fill with `0.0`, and convert `.to_numpy()` (which gives an `(n_states, n_states)` 2D array),
+
+reshaping that 2D array to `(1, n_states, n_states)` is the final step. That matches the 3D shape `(n_actions, n_states, n_states)` that your `value_iteration` function expects when treating the single fixed policy as an action set of size 1.
